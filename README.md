@@ -3,7 +3,7 @@
 ![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c.svg)
 
-This repository provides **ReFusion**, a multimodal reliability fusion network for **bearing / rotating machinery fault diagnosis** from windowed vibration, current, and RPM signals. It combines dual-domain encoders (time + frequency), per-modality heads, an **uncertainty-aware reliability gate**, hybrid logits–feature fusion, and an optional **Refiner**.
+This repository provides **ReFusion**, a multimodal reliability fusion network for **bearing / rotating machinery fault diagnosis** from windowed vibration, current, and RPM signals. It combines dual-domain encoders (time + frequency), per-modality heads, an **uncertainty-aware reliability gate**, hybrid logits–feature fusion, and  **Refiner**.
 
 No raw dataset is shipped: you place **preprocessed** CSV windows under `data/preprocessed_data/` (see **Data layout**).
 
@@ -54,17 +54,13 @@ python evaluate.py --checkpoint outputs/best_ReFusion.pth
 |------|------|
 | `refusion/network.py` | **ReFusion** (`nn.Module`), gates, fusion, Refiner |
 | `refusion/layers.py` | Per-modality linear classification head |
-| `data/data_loader.py` | CSV loaders, stratified split, augmentation |
 | `train.py` | Training loop, validation selection, test metrics |
 | `evaluate.py` | Load `ReFusion_state_dict` and run test evaluation |
-| `config/default.json` | Default hyperparameters and paths |
-| `reproduce/` | Reproduction notes and example result schema |
 
-Checkpoint format: `{"ReFusion_state_dict": ..., "fault_mapping": ...}`. Older files with `model_state_dict` are still accepted in `evaluate.py`.
 
 ---
 
-## Transfer learning (optional)
+## Transfer learning
 
 Set `pretrained_path` in `config/default.json`. Weights are aligned by modality order; legacy checkpoints containing `attention.*` keys are remapped when shapes match.
 
