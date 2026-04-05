@@ -15,7 +15,6 @@ from .layers import ModalityClassifier
 _EPS = 1e-8
 
 
-# ---------- Gradient reversal (GRL) for domain adaptation ----------
 class GradientReversalFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, lambda_: float) -> torch.Tensor:
@@ -125,60 +124,6 @@ class SEBlock(nn.Module):
         return x * w
 
 
-# ---------- Dual-domain encoder ----------
-class DualDomainEncoder(nn.Module):
-    def __init__(
-        self,
-        input_size: int = 1024,
-        latent_dim: int = 256,
-        dropout: float = 0.15,
-        time_channels: int = 24,
-        freq_out: int = 32,
-        lstm_hidden: int = 128,
-        lstm_layers: int = 1,
-    ):
-        super().__init__()
-        self.time_branch = TimeBranchMultiScale(out_channels_per_scale=time_channels, dilation=2)
-        time_ch = self.time_branch.out_channels
-        self.freq_branch = FreqBranch(input_size, out_channels=freq_out, hidden=64)
-        self.time_proj = nn.Sequential(
-            nn.Conv1d(time_ch, 64, 5, stride=2, padding=2),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Conv1d(64, 64, 5, stride=2, padding=2),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-        )
-        self.freq_proj = nn.Linear(self.freq_branch.out_dim, 64)
-        self.se = SEBlock(64)
-        self.lstm = nn.LSTM(
-            input_size=64,
-            hidden_size=lstm_hidden,
-            num_layers=lstm_layers,
-            batch_first=False,
-            bidirectional=True,
-            dropout=dropout if lstm_layers > 1 else 0,
-        )
-        lstm_out = lstm_hidden * 2
-        self.fc = nn.Sequential(
-            nn.Linear(lstm_out, latent_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        time_feat = self.time_branch(x)
-        time_feat = self.time_proj(time_feat)
-        freq_feat = self.freq_branch(x)
-        freq_feat = self.freq_proj(freq_feat).unsqueeze(-1).expand(-1, -1, time_feat.size(-1))
-        combined = time_feat + freq_feat
-        combined = self.se(combined)
-        combined = combined.permute(2, 0, 1)
-        _, (h_n, _) = self.lstm(combined)
-        z = torch.cat([h_n[-2], h_n[-1]], dim=1)
-        return self.fc(z)
-
-
 # ---------- Uncertainty-aware reliability gate ----------
 class UncertaintyAwareReliabilityGate(nn.Module):
     def __init__(
@@ -209,23 +154,6 @@ class UncertaintyAwareReliabilityGate(nn.Module):
     def entropy_from_logits(logits: torch.Tensor) -> torch.Tensor:
         p = F.softmax(logits, dim=-1).clamp(min=_EPS)
         return -(p * p.log()).sum(dim=-1)
-
-    def forward(
-        self,
-        h_list: List[torch.Tensor],
-        p_list: List[torch.Tensor],
-    ) -> torch.Tensor:
-        scores = []
-        for h, logits in zip(h_list, p_list):
-            ent = self.entropy_from_logits(logits).unsqueeze(1)
-            x = torch.cat([h, logits, ent], dim=1)
-            s = self.mlp(x)
-            scores.append(s)
-        stack = torch.stack(scores, dim=0)
-        if self.use_temperature:
-            T = torch.exp(self.log_T).clamp(min=_EPS)
-            stack = stack / T
-        return F.softmax(stack, dim=0)
 
 
 # ---------- Prototype loss ----------
@@ -400,70 +328,9 @@ class ReFusion(nn.Module):
             "gates_per_class": gates_norm,
             "embedding": h_fused,
         }
-
-        if self.use_domain_adaptation and self.domain_discriminators is not None and domain_labels is not None:
-            domain_losses = []
-            for i, m in enumerate(self.modalities):
-                z_rev = grl(h_prime_list[i], domain_grl_lambda)
-                domain_logits_m = self.domain_discriminators[m](z_rev)
-                domain_losses.append(F.cross_entropy(domain_logits_m, domain_labels.long().clamp(0, 1)))
-            out["domain_loss"] = torch.stack(domain_losses).mean()
-
-        if self.use_bad_modality and corrupted_modality_indices is not None:
-            mono_loss, record = self._compute_mono_loss(
-                gates_norm, reliability_scores, corrupted_modality_indices, corruption_gamma
-            )
-            out["mono_loss"] = mono_loss
-            out["bad_modality_record"] = record
-        return out
-
-    def _compute_mono_loss(
-        self,
-        gates_norm: torch.Tensor,
-        reliability_scores: Dict[str, torch.Tensor],
-        corrupted_modality_indices: torch.Tensor,
-        corruption_gamma: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Dict]:
-        B = gates_norm.size(1)
-        device = gates_norm.device
-        if (corrupted_modality_indices >= 0).sum() == 0:
-            return torch.tensor(0.0, device=device), {}
-        r_corrupted = []
-        gamma_list = []
-        for i in range(B):
-            if corrupted_modality_indices[i].item() < 0:
-                continue
-            m_idx = int(corrupted_modality_indices[i].item())
-            m_name = self.modalities[m_idx]
-            r_corrupted.append(reliability_scores[m_name][i])
-            gamma_list.append(corruption_gamma[i].item() if corruption_gamma is not None else 0.0)
-        r_corrupted = torch.stack(r_corrupted)
-        mono_loss = r_corrupted.mean()
-        record = {"r_m_corrupted": r_corrupted.detach(), "gamma": gamma_list}
-        return mono_loss, record
-
-
 def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-
-def supervised_contrastive_loss(
-    embedding: torch.Tensor,
-    labels: torch.Tensor,
-    temperature: float = 0.07,
-) -> torch.Tensor:
-    B = embedding.size(0)
-    if B < 2:
-        return embedding.new_zeros(1)
-    embedding = F.normalize(embedding, p=2, dim=1)
-    logits = torch.mm(embedding, embedding.t()) / max(temperature, _EPS)
-    mask = labels.unsqueeze(1) == labels.unsqueeze(0)
-    mask = mask.float()
-    exp_logits = torch.exp(logits) * (1 - torch.eye(B, device=logits.device))
-    log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + _EPS)
-    pos_per_sample = mask.sum(dim=1).clamp(min=1)
-    mean_log_prob = (mask * log_prob).sum(dim=1) / pos_per_sample
-    return -mean_log_prob.mean()
 
 
 if __name__ == "__main__":
@@ -483,9 +350,6 @@ if __name__ == "__main__":
     print("ReFusion final_logits:", out["final_logits"].shape)
     print("embedding:", out["embedding"].shape)
     print("Params:", f"{count_parameters(model):,}")
-
-    out_d = model(x, domain_labels=torch.tensor([0, 1, 0, 1]))
-    print("domain_loss" in out_d, out_d.get("domain_loss"))
 
     emb = out["embedding"]
     lab = torch.tensor([0, 1, 2, 0])
